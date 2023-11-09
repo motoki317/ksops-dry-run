@@ -6,6 +6,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/GoogleContainerTools/kpt-functions-sdk/go/fn"
 	"gopkg.in/yaml.v3"
 )
 
@@ -91,43 +93,74 @@ func mainCmd() error {
 
 	// We now know that the user wanted to use ksops-dry-run, so act like a
 	// normal kustomize plugin.
+	// See https://github.com/viaduct-ai/kustomize-sops/blob/master/ksops.go
 
-	// The KUSTOMIZE_PLUGIN_CONFIG_STRING environment variable contains the
-	// literal yaml of a generator config.
-	// See https://github.com/viaduct-ai/kustomize-sops#6-define-ksops-kustomize-generator.
-	kustomizePluginConfigString := os.Getenv("KUSTOMIZE_PLUGIN_CONFIG_STRING")
-	if kustomizePluginConfigString == "" {
-		return fmt.Errorf("required environment variable KUSTOMIZE_PLUGIN_CONFIG_STRING was not found")
+	// If one argument, assume KRM style
+	if len(os.Args) == 1 {
+		err := fn.AsMain(fn.ResourceListProcessorFunc(krm))
+		if err != nil {
+			return fmt.Errorf("unable to generate manifests: %w", err)
+		}
+		return nil
 	}
 
-	// The KUSTOMIZE_PLUGIN_CONFIG_ROOT environment variable contains the
-	// directory which contains the generator. Encrypted secret files are
-	// relative to this directory.
-	kustomizePluginConfigRoot := os.Getenv("KUSTOMIZE_PLUGIN_CONFIG_ROOT")
-	if kustomizePluginConfigRoot == "" {
-		return fmt.Errorf("required environment variable KUSTOMIZE_PLUGIN_CONFIG_ROOT was not found")
+	// If two argument, assume legacy style
+	manifest, err := os.ReadFile(os.Args[1])
+	if err != nil {
+		return fmt.Errorf("unable to read in manifest: %s", os.Args[1])
 	}
 
+	return generate(manifest, os.Stdout)
+}
+
+// See https://github.com/viaduct-ai/kustomize-sops/blob/master/ksops.go
+// https://pkg.go.dev/github.com/GoogleContainerTools/kpt-functions-sdk/go/fn#hdr-KRM_Function
+func krm(rl *fn.ResourceList) (bool, error) {
+	var items fn.KubeObjects
+	for _, manifest := range rl.Items {
+		var buf bytes.Buffer
+		err := generate([]byte(manifest.String()), &buf)
+		if err != nil {
+			rl.LogResult(err)
+			return false, err
+		}
+
+		// generate can return multiple manifests
+		objs, err := fn.ParseKubeObjects(buf.Bytes())
+		if err != nil {
+			rl.LogResult(err)
+			return false, err
+		}
+
+		items = append(items, objs...)
+	}
+
+	rl.Items = items
+
+	return true, nil
+}
+
+func generate(raw []byte, out io.Writer) error {
 	// Parse the ksops generator config.
-	config, err := parseKsopsGenerator([]byte(kustomizePluginConfigString))
+	config, err := parseKsopsGenerator(raw)
 	if err != nil {
 		return err
 	}
 
 	// Set up a yaml stream encoder so that every (stubbed) secret resource can
 	// be marshalled back to standard out with --- stream separators.
-	encoder := yaml.NewEncoder(os.Stdout)
+	encoder := yaml.NewEncoder(out)
 
 	// Process each encrypted secret file in the config and output equivalent
 	// secret resources with placeholder values.
 	for _, filename := range config.Files {
-		// Resolve the filename relative to the directory from which it was
-		// configured.
-		filename = filepath.Join(kustomizePluginConfigRoot, filename)
-
 		// Parse the (potentially multiple) secrets in this file, and generate
 		// as many stubbed secrets.
-		secrets, err := parseKsopsEncryptedSecrets(filename)
+		file, err := os.ReadFile(filename)
+		if err != nil {
+			return err
+		}
+		secrets, err := parseKsopsEncryptedSecrets(file)
 		if err != nil {
 			return err
 		}
@@ -160,16 +193,10 @@ func parseKsopsGenerator(body []byte) (*ksopsGeneratorConfig, error) {
 	return &config, nil
 }
 
-func parseKsopsEncryptedSecrets(filename string) ([]secret, error) {
-	file, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
+func parseKsopsEncryptedSecrets(raw []byte) ([]secret, error) {
 	// The decoder is used to read each yaml document from the stream one at a
 	// time until no more are left.
-	decoder := yaml.NewDecoder(file)
+	decoder := yaml.NewDecoder(bytes.NewReader(raw))
 
 	var secrets []secret
 	for {
