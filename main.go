@@ -9,13 +9,10 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io"
-	"os"
-	"path/filepath"
-	"syscall"
-
 	"github.com/GoogleContainerTools/kpt-functions-sdk/go/fn"
 	"gopkg.in/yaml.v3"
+	"io"
+	"os"
 )
 
 // metadata represents the standard kubernetes resource metadata.
@@ -67,34 +64,7 @@ func mainCmd() error {
 		return nil
 	}
 
-	// If the KSOPS_DRY_RUN environment variable exists, regardless of if it
-	// even has an associated value, then exec the original ksops plugin.
-	//
-	// The original ksops plugin is located in the following ways
-	// - Using ${KSOPS_PATH} verbatim.
-	// - Using ${XDG_CONFIG_HOME}/kustomize/plugin/viaduct.ai/v1/ksops/_ksops.
-	// - Using ${HOME}/.config/kustomize/plugin/viaduct.ai/v1/ksops/_ksops.
-	if _, found := os.LookupEnv("KSOPS_DRY_RUN"); !found {
-		var ksopsPath string
-		if path := os.Getenv("KSOPS_PATH"); path != "" {
-			ksopsPath = path
-		} else if path := os.Getenv("XDG_CONFIG_HOME"); path != "" {
-			ksopsPath = filepath.Join(path, "kustomize/plugin/viaduct.ai/v1/ksops/_ksops")
-		} else if path := os.Getenv("HOME"); path != "" {
-			ksopsPath = filepath.Join(path, ".config", "kustomize/plugin/viaduct.ai/v1/ksops/_ksops")
-		} else {
-			return fmt.Errorf("unable to resolve location of original ksops plugin")
-		}
-
-		// Exec the original ksops plugin. If successful, this function call
-		// will never return.
-		return syscall.Exec(ksopsPath, os.Args, os.Environ())
-	}
-
-	// We now know that the user wanted to use ksops-dry-run, so act like a
-	// normal kustomize plugin.
 	// See https://github.com/viaduct-ai/kustomize-sops/blob/master/ksops.go
-
 	// If one argument, assume KRM style
 	if len(os.Args) == 1 {
 		err := fn.AsMain(fn.ResourceListProcessorFunc(krm))
@@ -254,10 +224,12 @@ func parseKsopsEncryptedSecrets(raw []byte) ([]secret, error) {
 
 		// Add a custom label so that the user can use a label selector against the
 		// generated resources to e.g. ignore them during a kubectl apply.
-		if secret.Metadata.Labels == nil {
-			secret.Metadata.Labels = make(map[string]string)
+		if _, found := os.LookupEnv("KSOPS_DRY_RUN_ADD_LABEL"); found {
+			if secret.Metadata.Labels == nil {
+				secret.Metadata.Labels = make(map[string]string)
+			}
+			secret.Metadata.Labels["ksops-dry-run.joshdk.github.com"] = "true"
 		}
-		secret.Metadata.Labels["ksops-dry-run.joshdk.github.com"] = "true"
 
 		secrets = append(secrets, secret)
 	}
